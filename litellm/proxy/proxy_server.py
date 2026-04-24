@@ -196,7 +196,7 @@ def generate_feedback_box():
 
 
 import contextlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -1765,6 +1765,70 @@ def cost_tracking():
         )
 
 
+# Per-counter locks for spend reseed singleflight. Bounded LRU.
+_RESEED_LOCKS_MAX_SIZE = 10000
+_reseed_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+_reseed_locks_registry_lock: Optional[asyncio.Lock] = None
+
+
+async def _get_reseed_lock(counter_key: str) -> asyncio.Lock:
+    global _reseed_locks_registry_lock
+    if _reseed_locks_registry_lock is None:
+        _reseed_locks_registry_lock = asyncio.Lock()
+    async with _reseed_locks_registry_lock:
+        lock = _reseed_locks.get(counter_key)
+        if lock is not None:
+            _reseed_locks.move_to_end(counter_key)
+            return lock
+        lock = asyncio.Lock()
+        _reseed_locks[counter_key] = lock
+        if len(_reseed_locks) > _RESEED_LOCKS_MAX_SIZE:
+            _reseed_locks.popitem(last=False)
+        return lock
+
+
+async def _reseed_counter_from_db_locked(counter_key: str) -> Optional[float]:
+    """
+    Reseed a cold spend counter from the authoritative DB and warm the
+    cache, coalesced via a per-counter lock so concurrent callers (read
+    path + write path) collapse to one DB query per cold-cache window.
+
+    Returns the spend value (including 0.0 from a fresh budget reset)
+    when the DB read succeeds, or None when the DB is unavailable. On
+    None, callers fall back to their own stale-but-available source.
+    """
+    lock = await _get_reseed_lock(counter_key)
+    async with lock:
+        # Re-check after acquiring the lock - another waiter may have warmed it.
+        if spend_counter_cache.redis_cache is not None:
+            try:
+                val = await spend_counter_cache.redis_cache.async_get_cache(
+                    key=counter_key
+                )
+                if val is not None:
+                    return float(val)
+            except Exception:
+                pass
+        val = spend_counter_cache.in_memory_cache.get_cache(key=counter_key)
+        if val is not None:
+            return float(val)
+
+        db_spend = await _reseed_spend_from_db(counter_key)
+        if db_spend is None:
+            return None
+        # Warm even when 0 so subsequent reads hit cache, not DB.
+        try:
+            await spend_counter_cache.async_increment_cache(
+                key=counter_key, value=db_spend
+            )
+        except Exception:
+            verbose_proxy_logger.exception(
+                "_reseed_counter_from_db_locked: failed to warm counter %s",
+                counter_key,
+            )
+        return db_spend
+
+
 async def get_current_spend(counter_key: str, fallback_spend: float) -> float:
     """
     Read current spend from the cross-pod spend counter.
@@ -1777,7 +1841,8 @@ async def get_current_spend(counter_key: str, fallback_spend: float) -> float:
     Fallback chain:
     1. Redis counter (cross-pod, authoritative)
     2. In-memory counter (single-instance or Redis failure)
-    3. Cached object's .spend from DB (cold start, no counter yet)
+    3. Reseed from authoritative DB spend (counter expired, cross-pod stale)
+    4. Caller-supplied fallback (DB unavailable, cold start)
     """
     # 1. Try Redis first (cross-pod authoritative)
     if spend_counter_cache.redis_cache is not None:
@@ -1797,7 +1862,12 @@ async def get_current_spend(counter_key: str, fallback_spend: float) -> float:
     if val is not None:
         return float(val)
 
-    # 3. Final fallback: cached object's spend from DB
+    # 3. Reseed from DB - fallback_spend lags cross-pod, would allow bypass.
+    db_spend = await _reseed_counter_from_db_locked(counter_key)
+    if db_spend is not None:
+        return db_spend
+
+    # 4. Caller-supplied fallback (DB unavailable).
     return fallback_spend
 
 
@@ -1908,7 +1978,7 @@ async def increment_spend_counters(
         )
 
 
-async def _reseed_spend_from_db(counter_key: str) -> float:
+async def _reseed_spend_from_db(counter_key: str) -> Optional[float]:
     """
     Read the authoritative spend for a missing counter from the DB. The
     counter_key prefix encodes the table to query:
@@ -1919,17 +1989,19 @@ async def _reseed_spend_from_db(counter_key: str) -> float:
         spend:user:{user_id}              -> LiteLLM_UserTable.spend
         spend:org:{org_id}                -> LiteLLM_OrganizationTable.spend
 
-    Returns 0.0 if prisma is unavailable, the row is missing, or the
-    key format is unrecognized. On failure, logs and returns 0.0 rather
-    than raising so the caller can still record the current increment.
+    Returns the row's spend (including 0.0) when the DB is reachable and
+    the row exists. Returns None when prisma is unavailable, the row is
+    missing, the key format is unrecognized, or the query raises. Callers
+    use None to fall back to a caller-supplied value and a numeric return
+    (including 0.0) as authoritative.
     """
     if prisma_client is None:
-        return 0.0
+        return None
     # Per-window counters (spend:*:window:{duration}) share prefixes with
     # primary counters but don't correspond to a DB row; their ambiguity
     # would otherwise be silently parsed as a regular counter and miss.
     if ":window:" in counter_key:
-        return 0.0
+        return None
     try:
         if counter_key.startswith("spend:key:"):
             token = counter_key[len("spend:key:") :]
@@ -1939,7 +2011,7 @@ async def _reseed_spend_from_db(counter_key: str) -> float:
         elif counter_key.startswith("spend:team_member:"):
             suffix = counter_key[len("spend:team_member:") :]
             if ":" not in suffix:
-                return 0.0
+                return None
             user_id, team_id = suffix.rsplit(":", 1)
             row = await prisma_client.db.litellm_teammembership.find_unique(
                 where={"user_id_team_id": {"user_id": user_id, "team_id": team_id}}
@@ -1960,14 +2032,14 @@ async def _reseed_spend_from_db(counter_key: str) -> float:
                 where={"organization_id": org_id}
             )
         else:
-            return 0.0
+            return None
     except Exception:
         verbose_proxy_logger.exception(
             "Failed to reseed spend counter %s from DB", counter_key
         )
-        return 0.0
+        return None
     if row is None:
-        return 0.0
+        return None
     return float(getattr(row, "spend", 0.0) or 0.0)
 
 
@@ -1994,20 +2066,21 @@ async def _init_and_increment_spend_counter(
     """
     current = await spend_counter_cache.async_get_cache(key=counter_key)
     if current is None:
-        base_spend = await _reseed_spend_from_db(counter_key)
-        if prisma_client is None:
-            # Best-effort fallback when prisma is unavailable (tests or
-            # early-startup paths). May be stale but avoids resetting to 0.
+        # Shares the per-counter lock with get_current_spend.
+        db_spend = await _reseed_counter_from_db_locked(counter_key)
+        if db_spend is None:
+            # DB unavailable - fall back to in-process cache (may be stale).
             source = await user_api_key_cache.async_get_cache(key=source_cache_key)
+            base_spend: float = 0.0
             if source is not None:
                 if isinstance(source, dict):
                     base_spend = source.get("spend", 0.0) or 0.0
                 else:
                     base_spend = getattr(source, "spend", 0.0) or 0.0
-        if base_spend > 0:
-            await spend_counter_cache.async_increment_cache(
-                key=counter_key, value=base_spend
-            )
+            if base_spend > 0:
+                await spend_counter_cache.async_increment_cache(
+                    key=counter_key, value=base_spend
+                )
 
     await spend_counter_cache.async_increment_cache(key=counter_key, value=increment)
 
